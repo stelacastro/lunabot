@@ -33,6 +33,7 @@ Serviços utilizados (ambos com plano gratuito):
 import os
 import logging
 import tempfile
+import hashlib
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -72,10 +73,15 @@ if not WEBHOOK_URL:
 # definem essa variável automaticamente — não defina manualmente na nuvem.
 PORT = int(os.environ.get("PORT", 8443))
 
-# Caminho da rota do webhook. Usar o próprio token como parte do caminho
-# é uma prática comum para dificultar que outros descubram a URL e
-# mandem updates falsos para o seu bot.
-CAMINHO_WEBHOOK = TELEGRAM_BOT_TOKEN or "webhook"
+# Caminho da rota do webhook. Em vez de usar o token cru (que contém ":"
+# e pode quebrar o roteamento em alguns proxies/servidores), usamos um
+# hash dele — mantém o segredo (impossível de adivinhar sem o token
+# original) e é 100% seguro para URLs.
+CAMINHO_WEBHOOK = (
+    hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()
+    if TELEGRAM_BOT_TOKEN
+    else "webhook"
+)
 
 # Token secreto adicional que o Telegram envia em todo request ao
 # webhook (cabeçalho X-Telegram-Bot-Api-Secret-Token). O PTB valida
