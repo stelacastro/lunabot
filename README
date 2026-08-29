@@ -1,0 +1,17 @@
+# lunabot
+
+Bot que recebe uma foto no Telegram, faz busca reversa via Google Lens (através do SerpApi) e responde com o link da fonte original da imagem.
+
+## Como funciona
+1. O usuário envia uma foto no chat do bot.
+2. O bot baixa a foto temporariamente no servidor.
+3. A imagem é enviada ao ImgBB (hospedagem gratuita com auto-expiração) para gerar um link público temporário e seguro — necessário porque o Google Lens exige uma URL pública, e o link de arquivo do próprio Telegram contém o token do bot, o que seria inseguro repassar a terceiros.
+4. Esse link público é enviado ao SerpApi (engine=google_lens), que devolve os resultados da busca reversa.
+5. O bot extrai o melhor resultado — priorizando correspondência exata (exact_matches), e usando o resultado visual mais próximo (visual_matches) como alternativa — e responde ao usuário com o link da fonte.
+6. O arquivo local temporário é apagado logo após o processamento; a cópia no ImgBB expira sozinha.
+
+## Pré-requisitos
+1. Python 3.12 ou 3.13
+2. Conta no Telegram
+3. Conta gratuita no SerpApi
+4. Conta gratuita no ImgBB
