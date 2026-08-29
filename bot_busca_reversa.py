@@ -56,6 +56,33 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 
+# --- Configuração do WEBHOOK ---
+# WEBHOOK_URL: domínio público HTTPS do seu serviço, SEM caminho e SEM
+# barra no final. Ex: "https://meu-bot-production.up.railway.app"
+# No Railway, isso normalmente vem pronto na variável RAILWAY_PUBLIC_DOMAIN
+# (sem o "https://"), então montamos a URL completa automaticamente abaixo
+# caso WEBHOOK_URL não seja definida manualmente.
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+if not WEBHOOK_URL:
+    dominio_railway = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    if dominio_railway:
+        WEBHOOK_URL = f"https://{dominio_railway}"
+
+# Porta em que o servidor do webhook vai escutar. Serviços como Railway
+# definem essa variável automaticamente — não defina manualmente na nuvem.
+PORT = int(os.environ.get("PORT", 8443))
+
+# Caminho da rota do webhook. Usar o próprio token como parte do caminho
+# é uma prática comum para dificultar que outros descubram a URL e
+# mandem updates falsos para o seu bot.
+CAMINHO_WEBHOOK = TELEGRAM_BOT_TOKEN or "webhook"
+
+# Token secreto adicional que o Telegram envia em todo request ao
+# webhook (cabeçalho X-Telegram-Bot-Api-Secret-Token). O PTB valida
+# esse valor automaticamente e rejeita requisições que não o tenham,
+# bloqueando chamadas falsas à sua rota pública.
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN")
+
 # Tempo (em segundos) até a imagem expirar automaticamente no ImgBB.
 # Mínimo permitido pela API do ImgBB: 60 segundos.
 IMGBB_EXPIRATION_SECONDS = 120
@@ -173,8 +200,8 @@ async def buscar_imagem_google_lens(url_imagem_publica: str) -> dict | None:
 # -----------------------------------------------------------------------
 async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Oi, Luna! 👋 Me envia uma foto que eu vou tentar procurar ela "
-        "nos subúrbios da internet."
+        "Olá! 👋 Envie-me uma foto/imagem e eu vou tentar encontrar "
+        "a origem dela na internet através do Google Lens."
     )
 
 
@@ -190,7 +217,7 @@ async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not SERPAPI_API_KEY or not IMGBB_API_KEY:
             await mensagem.reply_text(
                 "⚠️ O bot não está configurado corretamente "
-                "(SERPAPI_API_KEY ou IMGBB_API_KEY ausente). Avise ao seu namorado Beni."
+                "(SERPAPI_API_KEY ou IMGBB_API_KEY ausente). Avise o administrador."
             )
             return
 
@@ -209,7 +236,7 @@ async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             if url_publica is None:
                 await aviso.edit_text(
-                    "🚫 Não consegui preparar a imagem pra busca! :( Tenta de novo?"
+                    "🚫 Não consegui preparar a imagem para a busca. Tente novamente."
                 )
                 return
 
@@ -221,15 +248,15 @@ async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if resultado is None or not resultado.get("url"):
             await aviso.edit_text(
-                "❌ Não consegui encontrar a origem dessa imagem! :("
-                "Tenta enviar uma imagem com melhor qualidade ou outro ângulo da mesma cena."
+                "❌ Não consegui encontrar a origem dessa imagem. "
+                "Tente enviar uma imagem com melhor qualidade ou outro ângulo da mesma cena."
             )
             return
 
         rotulo_confianca = (
-            "✅ *BEEP, BEEP! Correspondência exata encontrada saindo quentinha para Luna!*"
+            "✅ *Correspondência exata encontrada!*"
             if resultado["tipo_match"] == "exato"
-            else "🔎 *BEEP, BEEP! Resultado mais similar encontrado saindo quentinho para Luna:*"
+            else "🔎 *Resultado mais similar encontrado:*"
         )
         titulo = _escapar_markdown(resultado["titulo"])
         fonte = f"\n*Fonte:* {_escapar_markdown(resultado['fonte'])}" if resultado.get("fonte") else ""
@@ -292,6 +319,12 @@ def main() -> None:
         raise RuntimeError(
             "A variável de ambiente TELEGRAM_BOT_TOKEN não foi definida."
         )
+    if not WEBHOOK_URL:
+        raise RuntimeError(
+            "Nenhuma URL pública encontrada para o webhook. Defina a variável "
+            "de ambiente WEBHOOK_URL manualmente (ex: https://seu-app.up.railway.app), "
+            "ou garanta que o serviço tenha um domínio público gerado na plataforma."
+        )
 
     aplicacao = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -299,8 +332,20 @@ def main() -> None:
     aplicacao.add_handler(MessageHandler(filters.PHOTO, processar_foto))
     aplicacao.add_error_handler(tratador_de_erros)
 
-    logger.info("Bot iniciado. Aguardando mensagens...")
-    aplicacao.run_polling(allowed_updates=Update.ALL_TYPES)
+    url_completa_webhook = f"{WEBHOOK_URL.rstrip('/')}/{CAMINHO_WEBHOOK}"
+    logger.info("Bot iniciado em modo webhook: %s", url_completa_webhook)
+
+    # run_webhook sobe um mini-servidor HTTP interno (via Tornado), registra
+    # a URL no Telegram automaticamente e passa a receber updates via POST
+    # em vez de ficar perguntando (polling) a cada poucos segundos.
+    aplicacao.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=CAMINHO_WEBHOOK,
+        webhook_url=url_completa_webhook,
+        secret_token=WEBHOOK_SECRET_TOKEN or None,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
