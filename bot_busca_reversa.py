@@ -463,6 +463,27 @@ async def tratador_de_erros(update: object, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # -----------------------------------------------------------------------
+# CONFIGURAÇÃO DO MENU DE COMANDOS (aparece ao lado da caixa de texto)
+# -----------------------------------------------------------------------
+async def configurar_menu_comandos(aplicacao: Application) -> None:
+    """
+    Registra a lista de comandos do bot junto ao Telegram. Isso faz
+    aparecer um atalho (ícone de menu "/") ao lado da caixa de mensagem
+    no app do Telegram, com cada comando e sua descrição — facilita
+    muito a descoberta de funcionalidades pelo usuário, sem precisar
+    digitar tudo manualmente.
+
+    Executado automaticamente uma vez, na inicialização do bot
+    (via post_init do Application).
+    """
+    await aplicacao.bot.set_my_commands([
+        ("start", "Iniciar o bot e ver a mensagem de boas-vindas"),
+        ("help", "Ver instruções de uso e dicas"),
+    ])
+    logger.info("Menu de comandos configurado com sucesso.")
+
+
+# -----------------------------------------------------------------------
 # INICIALIZAÇÃO DO BOT
 # -----------------------------------------------------------------------
 def main() -> None:
@@ -477,7 +498,12 @@ def main() -> None:
             "ou garanta que o serviço tenha um domínio público gerado na plataforma."
         )
 
-    aplicacao = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    aplicacao = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(configurar_menu_comandos)
+        .build()
+    )
 
     aplicacao.add_handler(CommandHandler("start", comando_start))
     aplicacao.add_handler(CommandHandler("help", comando_help))
