@@ -34,6 +34,7 @@ import os
 import logging
 import tempfile
 import hashlib
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -103,20 +104,26 @@ async def hospedar_imagem_temporariamente(caminho_imagem: Path) -> str | None:
     with open(caminho_imagem, "rb") as arquivo_imagem:
         conteudo = arquivo_imagem.read()
 
+    # Enviamos a imagem como string base64 (em vez de arquivo binário puro
+    # via multipart) porque é o formato oficialmente documentado pelo
+    # ImgBB e o mais confiável — o envio binário bruto às vezes é
+    # rejeitado pelo servidor deles com "Empty upload source".
+    imagem_base64 = base64.b64encode(conteudo).decode("ascii")
+
     form = aiohttp.FormData()
     form.add_field("key", IMGBB_API_KEY)
     form.add_field("expiration", str(IMGBB_EXPIRATION_SECONDS))
-    form.add_field(
-        "image",
-        conteudo,
-        filename=caminho_imagem.name,
-        content_type="application/octet-stream",
-    )
+    form.add_field("image", imagem_base64)
 
     async with aiohttp.ClientSession() as session:
         async with session.post(IMGBB_ENDPOINT, data=form, timeout=30) as resposta:
+            corpo_resposta = await resposta.text()
             if resposta.status != 200:
-                logger.error("ImgBB retornou status HTTP %s", resposta.status)
+                logger.error(
+                    "ImgBB retornou status HTTP %s. Corpo da resposta: %s",
+                    resposta.status,
+                    corpo_resposta,
+                )
                 return None
             dados = await resposta.json()
 
