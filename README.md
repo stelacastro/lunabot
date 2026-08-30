@@ -1,4 +1,4 @@
-# 🔎 LunaBot — Busca Reversa de Imagens para Telegram
+# 🔎 LunaBot
 
 Bot do Telegram que recebe uma foto e encontra sua origem na internet usando o **Google Lens** (via SerpApi). Responde com o link da fonte, uma miniatura da imagem encontrada, e permite navegar entre múltiplos resultados através de botões interativos.
 
