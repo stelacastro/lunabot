@@ -35,12 +35,13 @@ import logging
 import tempfile
 import hashlib
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 load_dotenv()  # Carrega variáveis do arquivo .env, se ele existir
 
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -172,6 +173,7 @@ async def buscar_imagem_google_lens(url_imagem_publica: str) -> list[dict]:
             "titulo": item.get("title", "Fonte encontrada"),
             "url": link,
             "fonte": item.get("source"),
+            "thumbnail": item.get("thumbnail"),
             "tipo_match": tipo,
         })
 
@@ -195,6 +197,62 @@ def _escapar_markdown(texto: str | None) -> str:
     return texto
 
 
+# Mapeamento de trechos de domínio -> nome amigável exibido ao usuário.
+# A checagem é por "contém", então cobre subdomínios (ex: br.pinterest.com,
+# m.facebook.com, www.instagram.com etc.) sem precisar listar cada variação.
+DOMINIOS_AMIGAVEIS = {
+    "instagram.com": "Instagram",
+    "pinterest.": "Pinterest",
+    "deviantart.com": "DeviantArt",
+    "twitter.com": "Twitter/X",
+    "x.com": "Twitter/X",
+    "facebook.com": "Facebook",
+    "reddit.com": "Reddit",
+    "tumblr.com": "Tumblr",
+    "flickr.com": "Flickr",
+    "wikipedia.org": "Wikipédia",
+    "youtube.com": "YouTube",
+    "tiktok.com": "TikTok",
+    "amazon.": "Amazon",
+    "etsy.com": "Etsy",
+    "shutterstock.com": "Shutterstock",
+    "gettyimages.com": "Getty Images",
+    "artstation.com": "ArtStation",
+    "behance.net": "Behance",
+    "imgur.com": "Imgur",
+    "linkedin.com": "LinkedIn",
+    "ebay.com": "eBay",
+    "aliexpress.com": "AliExpress",
+    "weheartit.com": "We Heart It",
+}
+
+
+def nome_amigavel_da_fonte(url: str, fonte_original: str | None) -> str:
+    """
+    Converte o domínio de uma URL em um nome de marca reconhecível
+    (ex: 'www.instagram.com' -> 'Instagram'). Se o domínio não estiver
+    mapeado, usa o campo 'source' que o próprio SerpApi já devolve, ou
+    por último, capitaliza o nome do domínio como fallback.
+    """
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        netloc = ""
+    netloc_sem_www = netloc.removeprefix("www.")
+
+    for trecho, nome_amigavel in DOMINIOS_AMIGAVEIS.items():
+        if trecho in netloc_sem_www:
+            return nome_amigavel
+
+    if fonte_original:
+        return fonte_original
+
+    partes = netloc_sem_www.split(".")
+    if partes and partes[0]:
+        return partes[0].capitalize()
+    return "Fonte desconhecida"
+
+
 def formatar_resultado(resultado: dict, indice: int, total: int) -> str:
     """Monta o texto (Markdown) de um resultado específico."""
     rotulo_confianca = (
@@ -203,11 +261,8 @@ def formatar_resultado(resultado: dict, indice: int, total: int) -> str:
         else "🔎 *Resultado visual encontrado:*"
     )
     titulo = _escapar_markdown(resultado["titulo"])
-    fonte = (
-        f"\n*Fonte:* {_escapar_markdown(resultado['fonte'])}"
-        if resultado.get("fonte")
-        else ""
-    )
+    nome_fonte = nome_amigavel_da_fonte(resultado["url"], resultado.get("fonte"))
+    fonte = f"\n*Fonte:* {_escapar_markdown(nome_fonte)}"
     posicao = f"\n_Resultado {indice + 1} de {total}_" if total > 1 else ""
 
     return (
@@ -250,6 +305,72 @@ def montar_teclado_lista(resultados: list[dict]) -> InlineKeyboardMarkup:
         ])
     linhas.append([InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")])
     return InlineKeyboardMarkup(linhas)
+
+
+# -----------------------------------------------------------------------
+# HELPERS DE EXIBIÇÃO "FOTO-AWARE"
+# -----------------------------------------------------------------------
+# O Telegram não permite editar uma mensagem de TEXTO para virar uma
+# mensagem de FOTO (ou vice-versa) via edit_text/edit_message_media —
+# são tipos de mensagem diferentes. Por isso, estas funções detectam o
+# tipo da mensagem atual e decidem entre editar no lugar (mesmo tipo)
+# ou apagar + enviar uma nova (mudança de tipo), sempre retornando a
+# mensagem final para que o próximo clique de botão continue funcionando.
+
+async def exibir_resultado(context, mensagem_atual, resultado: dict, indice: int, total: int):
+    """Mostra um resultado, com miniatura (foto) quando disponível."""
+    texto = formatar_resultado(resultado, indice, total)
+    teclado = montar_teclado_resultado(indice, total)
+    thumbnail = resultado.get("thumbnail")
+    chat_id = mensagem_atual.chat_id
+
+    if thumbnail:
+        # Precisamos de uma mensagem de FOTO. Se a mensagem atual já for
+        # uma foto, tentamos trocar só a mídia (mais leve); se falhar ou
+        # se a mensagem atual for de texto, apagamos e enviamos uma nova.
+        if mensagem_atual.photo:
+            try:
+                return await context.bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=mensagem_atual.message_id,
+                    media=InputMediaPhoto(
+                        media=thumbnail, caption=texto, parse_mode=ParseMode.MARKDOWN
+                    ),
+                    reply_markup=teclado,
+                )
+            except Exception:
+                logger.warning("Falha ao trocar mídia da mensagem; enviando nova.")
+
+        try:
+            await mensagem_atual.delete()
+        except Exception:
+            pass
+        return await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=thumbnail,
+            caption=texto,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=teclado,
+        )
+
+    # Sem miniatura disponível: exibimos como mensagem de texto normal.
+    return await exibir_texto(context, mensagem_atual, texto, teclado)
+
+
+async def exibir_texto(context, mensagem_atual, texto: str, teclado: InlineKeyboardMarkup | None = None):
+    """Mostra uma mensagem de texto simples, migrando de foto pra texto se necessário."""
+    chat_id = mensagem_atual.chat_id
+
+    if mensagem_atual.photo:
+        try:
+            await mensagem_atual.delete()
+        except Exception:
+            pass
+        return await context.bot.send_message(
+            chat_id=chat_id, text=texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado
+        )
+
+    return await mensagem_atual.edit_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado)
 
 
 # -----------------------------------------------------------------------
@@ -311,11 +432,7 @@ async def executar_pipeline_busca(
             "indice_atual": 0,
         }
 
-        texto = formatar_resultado(resultados[0], 0, len(resultados))
-        teclado = montar_teclado_resultado(0, len(resultados))
-        await mensagem_status.edit_text(
-            texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado
-        )
+        await exibir_resultado(context, mensagem_status, resultados[0], 0, len(resultados))
 
     except aiohttp.ClientError:
         logger.exception("Erro de rede ao consultar os serviços externos.")
@@ -396,7 +513,8 @@ async def tratar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     estado = context.user_data.get("ultima_busca")
     if not estado:
-        await query.edit_message_text(
+        await exibir_texto(
+            context, query.message,
             "⚠️ Essa busca expirou. Envie a foto novamente para buscar de novo."
         )
         return
@@ -404,17 +522,17 @@ async def tratar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     acao = query.data
 
     if acao == "novamente":
-        await query.edit_message_text("🔎 Iniciando nova busca...")
-        await executar_pipeline_busca(estado["file_id"], context, query.message)
+        mensagem_status = await exibir_texto(context, query.message, "🔎 Iniciando nova busca...")
+        await executar_pipeline_busca(estado["file_id"], context, mensagem_status)
         return
 
     if acao == "listar":
         resultados = estado["resultados"]
         teclado = montar_teclado_lista(resultados)
-        await query.edit_message_text(
+        await exibir_texto(
+            context, query.message,
             "📋 *Resultados encontrados:*\nEscolha um para ver os detalhes.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=teclado,
+            teclado,
         )
         return
 
@@ -424,18 +542,19 @@ async def tratar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         proximo_indice = indice_atual + 1
 
         if proximo_indice >= len(resultados):
-            await query.edit_message_text(
+            await exibir_texto(
+                context, query.message,
                 "🤷 Não há mais resultados alternativos para essa imagem.",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")]]
                 ),
             )
             return
 
         estado["indice_atual"] = proximo_indice
-        texto = formatar_resultado(resultados[proximo_indice], proximo_indice, len(resultados))
-        teclado = montar_teclado_resultado(proximo_indice, len(resultados))
-        await query.edit_message_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado)
+        await exibir_resultado(
+            context, query.message, resultados[proximo_indice], proximo_indice, len(resultados)
+        )
         return
 
     if acao.startswith("escolher:"):
@@ -443,13 +562,13 @@ async def tratar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         resultados = estado["resultados"]
 
         if indice_escolhido >= len(resultados):
-            await query.edit_message_text("⚠️ Resultado inválido.")
+            await exibir_texto(context, query.message, "⚠️ Resultado inválido.")
             return
 
         estado["indice_atual"] = indice_escolhido
-        texto = formatar_resultado(resultados[indice_escolhido], indice_escolhido, len(resultados))
-        teclado = montar_teclado_resultado(indice_escolhido, len(resultados))
-        await query.edit_message_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado)
+        await exibir_resultado(
+            context, query.message, resultados[indice_escolhido], indice_escolhido, len(resultados)
+        )
         return
 
     logger.warning("Callback desconhecido recebido: %s", acao)
