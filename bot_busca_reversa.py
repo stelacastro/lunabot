@@ -6,7 +6,7 @@
 Funcionamento:
 1. O usuário envia uma foto no chat do Telegram.
 2. O bot baixa a foto temporariamente no servidor.
-3. A imagem é enviada para o ImgBB (host de imagens gratuito, com
+3. A imagem é enviada ao ImgBB (host de imagens gratuito, com
    auto-expiração) para gerar um link público temporário e seguro
    — necessário porque o Google Lens exige uma URL pública, e o
    link de arquivo do próprio Telegram contém o TOKEN do bot,
@@ -14,19 +14,19 @@ Funcionamento:
 4. Esse link público é enviado ao SerpApi (engine=google_lens), que
    faz a busca reversa real no Google Lens e devolve os resultados
    visuais mais relevantes.
-5. O bot extrai o melhor resultado (exact match, se houver, senão o
-   primeiro visual match) e responde ao usuário com o link da fonte.
+5. O bot mostra o melhor resultado com botões interativos:
+   🔄 Buscar de novo | 📋 Ver outros resultados | ❌ Não é isso
 6. O arquivo local temporário é removido após o processamento; a
    cópia no ImgBB expira automaticamente sozinha.
+7. O bot roda em modo WEBHOOK (não polling) — mais eficiente para
+   hospedagem em nuvem (ex: Railway).
 
 Bibliotecas necessárias:
-    pip install python-telegram-bot==21.6 aiohttp python-dotenv
+    pip install "python-telegram-bot[webhooks]==21.6" aiohttp python-dotenv
 
 Serviços utilizados (ambos com plano gratuito):
     - SerpApi (Google Lens):  https://serpapi.com/google-lens-api
-      -> 250 buscas grátis/mês
     - ImgBB (hospedagem temporária de imagem): https://api.imgbb.com/
-      -> gratuito, sem necessidade de cartão de crédito
 =======================================================================
 """
 
@@ -40,12 +40,13 @@ from dotenv import load_dotenv
 load_dotenv()  # Carrega variáveis do arquivo .env, se ele existir
 
 import aiohttp
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -58,39 +59,27 @@ SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 
 # --- Configuração do WEBHOOK ---
-# WEBHOOK_URL: domínio público HTTPS do seu serviço, SEM caminho e SEM
-# barra no final. Ex: "https://meu-bot-production.up.railway.app"
-# No Railway, isso normalmente vem pronto na variável RAILWAY_PUBLIC_DOMAIN
-# (sem o "https://"), então montamos a URL completa automaticamente abaixo
-# caso WEBHOOK_URL não seja definida manualmente.
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 if not WEBHOOK_URL:
     dominio_railway = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     if dominio_railway:
         WEBHOOK_URL = f"https://{dominio_railway}"
 
-# Porta em que o servidor do webhook vai escutar. Serviços como Railway
-# definem essa variável automaticamente — não defina manualmente na nuvem.
 PORT = int(os.environ.get("PORT", 8443))
 
-# Caminho da rota do webhook. Em vez de usar o token cru (que contém ":"
-# e pode quebrar o roteamento em alguns proxies/servidores), usamos um
-# hash dele — mantém o segredo (impossível de adivinhar sem o token
-# original) e é 100% seguro para URLs.
+# Caminho da rota do webhook: hash do token (URL-safe, não expõe o
+# token cru — que contém ":" e pode quebrar roteamento em alguns proxies).
 CAMINHO_WEBHOOK = (
     hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()
     if TELEGRAM_BOT_TOKEN
     else "webhook"
 )
 
-# Token secreto adicional que o Telegram envia em todo request ao
-# webhook (cabeçalho X-Telegram-Bot-Api-Secret-Token). O PTB valida
-# esse valor automaticamente e rejeita requisições que não o tenham,
-# bloqueando chamadas falsas à sua rota pública.
 WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN")
 
-# Tempo (em segundos) até a imagem expirar automaticamente no ImgBB.
-# Mínimo permitido pela API do ImgBB: 60 segundos.
+# Quantos resultados no máximo mostrar como alternativas
+MAX_RESULTADOS = 5
+# Tempo de expiração da imagem no ImgBB (segundos)
 IMGBB_EXPIRATION_SECONDS = 120
 
 IMGBB_ENDPOINT = "https://api.imgbb.com/1/upload"
@@ -110,10 +99,6 @@ logger = logging.getLogger(__name__)
 # FUNÇÃO AUXILIAR 1: sobe a imagem para o ImgBB e retorna a URL pública
 # -----------------------------------------------------------------------
 async def hospedar_imagem_temporariamente(caminho_imagem: Path) -> str | None:
-    """
-    Faz upload da imagem para o ImgBB com auto-expiração e retorna
-    a URL pública gerada, ou None em caso de falha.
-    """
     with open(caminho_imagem, "rb") as arquivo_imagem:
         conteudo = arquivo_imagem.read()
 
@@ -144,19 +129,18 @@ async def hospedar_imagem_temporariamente(caminho_imagem: Path) -> str | None:
 # -----------------------------------------------------------------------
 # FUNÇÃO AUXILIAR 2: consulta o Google Lens via SerpApi
 # -----------------------------------------------------------------------
-async def buscar_imagem_google_lens(url_imagem_publica: str) -> dict | None:
+async def buscar_imagem_google_lens(url_imagem_publica: str) -> list[dict]:
     """
-    Envia a URL pública da imagem ao SerpApi (engine=google_lens) e
-    retorna o melhor resultado encontrado, ou None se nada relevante
-    for encontrado.
-
-    Retorno esperado (dict):
+    Consulta o SerpApi (engine=google_lens) e retorna uma LISTA com até
+    MAX_RESULTADOS resultados (correspondências exatas primeiro, depois
+    correspondências visuais), cada um no formato:
         {
             "titulo": str,
             "url": str,
             "fonte": str | None,
             "tipo_match": "exato" | "visual",
         }
+    Retorna lista vazia se nada for encontrado ou a API falhar.
     """
     params = {
         "engine": "google_lens",
@@ -169,121 +153,179 @@ async def buscar_imagem_google_lens(url_imagem_publica: str) -> dict | None:
         async with session.get(SERPAPI_ENDPOINT, params=params, timeout=30) as resposta:
             if resposta.status != 200:
                 logger.error("SerpApi retornou status HTTP %s", resposta.status)
-                return None
+                return []
             dados = await resposta.json()
 
     if dados.get("search_metadata", {}).get("status") != "Success":
         logger.error("Busca no SerpApi não teve sucesso: %s", dados.get("search_metadata"))
-        return None
+        return []
 
-    # Prioridade 1: correspondências exatas (mais confiáveis)
-    correspondencias_exatas = dados.get("exact_matches", [])
-    if correspondencias_exatas:
-        melhor = correspondencias_exatas[0]
-        return {
-            "titulo": melhor.get("title", "Fonte encontrada"),
-            "url": melhor.get("link"),
-            "fonte": melhor.get("source"),
-            "tipo_match": "exato",
-        }
+    resultados: list[dict] = []
+    urls_ja_vistas: set[str] = set()
 
-    # Prioridade 2: correspondências visuais (similares, não exatas)
-    correspondencias_visuais = dados.get("visual_matches", [])
-    if correspondencias_visuais:
-        melhor = correspondencias_visuais[0]
-        return {
-            "titulo": melhor.get("title", "Fonte encontrada"),
-            "url": melhor.get("link"),
-            "fonte": melhor.get("source"),
-            "tipo_match": "visual",
-        }
+    def _adicionar(item: dict, tipo: str) -> None:
+        link = item.get("link")
+        if not link or link in urls_ja_vistas:
+            return
+        urls_ja_vistas.add(link)
+        resultados.append({
+            "titulo": item.get("title", "Fonte encontrada"),
+            "url": link,
+            "fonte": item.get("source"),
+            "tipo_match": tipo,
+        })
 
-    return None
+    for item in dados.get("exact_matches", []):
+        _adicionar(item, "exato")
+    for item in dados.get("visual_matches", []):
+        _adicionar(item, "visual")
+
+    return resultados[:MAX_RESULTADOS]
 
 
 # -----------------------------------------------------------------------
-# HANDLER: /start
+# FORMATAÇÃO DE MENSAGENS E TECLADOS
 # -----------------------------------------------------------------------
-async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Olá! 👋 Envie-me uma foto/imagem e eu vou tentar encontrar "
-        "a origem dela na internet através do Google Lens."
+def _escapar_markdown(texto: str | None) -> str:
+    if not texto:
+        return texto or ""
+    caracteres_especiais = ["_", "*", "`", "["]
+    for caractere in caracteres_especiais:
+        texto = texto.replace(caractere, f"\\{caractere}")
+    return texto
+
+
+def formatar_resultado(resultado: dict, indice: int, total: int) -> str:
+    """Monta o texto (Markdown) de um resultado específico."""
+    rotulo_confianca = (
+        "✅ *Correspondência exata encontrada!*"
+        if resultado["tipo_match"] == "exato"
+        else "🔎 *Resultado visual encontrado:*"
+    )
+    titulo = _escapar_markdown(resultado["titulo"])
+    fonte = (
+        f"\n*Fonte:* {_escapar_markdown(resultado['fonte'])}"
+        if resultado.get("fonte")
+        else ""
+    )
+    posicao = f"\n_Resultado {indice + 1} de {total}_" if total > 1 else ""
+
+    return (
+        f"{rotulo_confianca}\n\n"
+        f"*Título:* {titulo}{fonte}\n"
+        f"*Link:* {resultado['url']}"
+        f"{posicao}"
     )
 
 
-# -----------------------------------------------------------------------
-# HANDLER PRINCIPAL: recebe a foto e processa a busca reversa
-# -----------------------------------------------------------------------
-async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    mensagem = update.message
-    caminho_temp: Path | None = None
+def montar_teclado_resultado(indice: int, total: int) -> InlineKeyboardMarkup:
+    """Teclado mostrado junto de um resultado individual."""
+    linhas = []
 
+    linha_navegacao = []
+    if total > 1:
+        linha_navegacao.append(
+            InlineKeyboardButton("❌ Não é isso", callback_data="proximo")
+        )
+    linhas.append(linha_navegacao) if linha_navegacao else None
+
+    linha_acoes = [InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")]
+    if total > 1:
+        linha_acoes.append(
+            InlineKeyboardButton("📋 Ver outros resultados", callback_data="listar")
+        )
+    linhas.append(linha_acoes)
+
+    return InlineKeyboardMarkup(linhas)
+
+
+def montar_teclado_lista(resultados: list[dict]) -> InlineKeyboardMarkup:
+    """Teclado com um botão por resultado, para o usuário escolher qual ver."""
+    linhas = []
+    for i, resultado in enumerate(resultados):
+        rotulo = resultado["titulo"][:40]
+        emoji = "✅" if resultado["tipo_match"] == "exato" else "🔎"
+        linhas.append([
+            InlineKeyboardButton(f"{emoji} {rotulo}", callback_data=f"escolher:{i}")
+        ])
+    linhas.append([InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")])
+    return InlineKeyboardMarkup(linhas)
+
+
+# -----------------------------------------------------------------------
+# PIPELINE DE BUSCA (reutilizado pelo envio de foto E pelo botão "buscar de novo")
+# -----------------------------------------------------------------------
+async def executar_pipeline_busca(
+    file_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    mensagem_status,
+) -> None:
+    """
+    Baixa a imagem, hospeda, consulta o Google Lens e edita
+    'mensagem_status' progressivamente até mostrar o resultado final.
+    Guarda os resultados em context.user_data para uso pelos botões.
+    """
+    caminho_temp: Path | None = None
     try:
-        # Validação de configuração
         if not SERPAPI_API_KEY or not IMGBB_API_KEY:
-            await mensagem.reply_text(
+            await mensagem_status.edit_text(
                 "⚠️ O bot não está configurado corretamente "
                 "(SERPAPI_API_KEY ou IMGBB_API_KEY ausente). Avise o administrador."
             )
             return
 
-        aviso = await mensagem.reply_text("🔎 Buscando a origem da imagem, aguarde...")
-
-        # Pega a foto em maior resolução enviada pelo usuário
-        foto = mensagem.photo[-1]
-        arquivo = await foto.get_file()
+        arquivo = await context.bot.get_file(file_id)
 
         with tempfile.TemporaryDirectory() as pasta_temp:
-            caminho_temp = Path(pasta_temp) / f"{foto.file_unique_id}.jpg"
+            caminho_temp = Path(pasta_temp) / f"{file_id}.jpg"
             await arquivo.download_to_drive(custom_path=caminho_temp)
 
-            # 1) Sobe a imagem para obter uma URL pública temporária e segura
+            await mensagem_status.edit_text("📤 Enviando imagem...")
             url_publica = await hospedar_imagem_temporariamente(caminho_temp)
 
             if url_publica is None:
-                await aviso.edit_text(
+                await mensagem_status.edit_text(
                     "🚫 Não consegui preparar a imagem para a busca. Tente novamente."
                 )
                 return
 
-            # 2) Consulta o Google Lens com essa URL
-            resultado = await buscar_imagem_google_lens(url_publica)
+            await mensagem_status.edit_text("🔍 Consultando o Google Lens...")
+            resultados = await buscar_imagem_google_lens(url_publica)
 
-        # Ao sair do 'with', o arquivo local já foi apagado automaticamente.
         _remover_arquivo_temporario(caminho_temp)
 
-        if resultado is None or not resultado.get("url"):
-            await aviso.edit_text(
+        if not resultados:
+            await mensagem_status.edit_text(
                 "❌ Não consegui encontrar a origem dessa imagem. "
-                "Tente enviar uma imagem com melhor qualidade ou outro ângulo da mesma cena."
+                "Tente enviar uma imagem com melhor qualidade ou outro ângulo da mesma cena.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")]]
+                ),
             )
             return
 
-        rotulo_confianca = (
-            "✅ *Correspondência exata encontrada!*"
-            if resultado["tipo_match"] == "exato"
-            else "🔎 *Resultado mais similar encontrado:*"
-        )
-        titulo = _escapar_markdown(resultado["titulo"])
-        fonte = f"\n*Fonte:* {_escapar_markdown(resultado['fonte'])}" if resultado.get("fonte") else ""
+        # Guarda o estado da busca para os botões interativos usarem depois
+        context.user_data["ultima_busca"] = {
+            "file_id": file_id,
+            "resultados": resultados,
+            "indice_atual": 0,
+        }
 
-        texto_resposta = (
-            f"{rotulo_confianca}\n\n"
-            f"*Título:* {titulo}{fonte}\n"
-            f"*Link:* {resultado['url']}"
+        texto = formatar_resultado(resultados[0], 0, len(resultados))
+        teclado = montar_teclado_resultado(0, len(resultados))
+        await mensagem_status.edit_text(
+            texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado
         )
-
-        await aviso.edit_text(texto_resposta, parse_mode=ParseMode.MARKDOWN)
 
     except aiohttp.ClientError:
         logger.exception("Erro de rede ao consultar os serviços externos.")
-        await mensagem.reply_text(
+        await mensagem_status.edit_text(
             "🚫 Não foi possível me conectar ao serviço de busca reversa "
             "no momento. Tente novamente em instantes."
         )
     except Exception:
         logger.exception("Erro inesperado ao processar a foto.")
-        await mensagem.reply_text(
+        await mensagem_status.edit_text(
             "🚫 Ocorreu um erro inesperado ao processar sua imagem. "
             "Tente novamente mais tarde."
         )
@@ -292,7 +334,6 @@ async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _remover_arquivo_temporario(caminho: Path | None) -> None:
-    """Remove o arquivo temporário local do disco, se ele ainda existir."""
     if caminho and caminho.exists():
         try:
             caminho.unlink()
@@ -300,14 +341,118 @@ def _remover_arquivo_temporario(caminho: Path | None) -> None:
             logger.warning("Não foi possível remover o arquivo temporário: %s", caminho)
 
 
-def _escapar_markdown(texto: str) -> str:
-    """Escapa caracteres especiais do Markdown legado do Telegram."""
-    if not texto:
-        return texto
-    caracteres_especiais = ["_", "*", "`", "["]
-    for caractere in caracteres_especiais:
-        texto = texto.replace(caractere, f"\\{caractere}")
-    return texto
+# -----------------------------------------------------------------------
+# HANDLER: /start
+# -----------------------------------------------------------------------
+async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Olá! 👋 Envie-me uma foto/imagem e eu vou tentar encontrar "
+        "a origem dela na internet através do Google Lens.\n\n"
+        "Use /help para ver exemplos de uso."
+    )
+
+
+# -----------------------------------------------------------------------
+# HANDLER: /help
+# -----------------------------------------------------------------------
+async def comando_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    texto_ajuda = (
+        "🤖 *Como usar este bot*\n\n"
+        "1️⃣ Envie uma *foto* diretamente no chat (não como arquivo/documento).\n"
+        "2️⃣ Aguarde alguns segundos enquanto eu busco a origem dela no Google Lens.\n"
+        "3️⃣ Eu te mostro o resultado mais provável, com botões para:\n"
+        "   • 🔄 *Buscar de novo* — refaz a busca do zero\n"
+        "   • 📋 *Ver outros resultados* — mostra até 5 fontes possíveis\n"
+        "   • ❌ *Não é isso* — pula para o próximo resultado mais provável\n\n"
+        "*Dicas para melhores resultados:*\n"
+        "• Envie fotos nítidas e com boa resolução\n"
+        "• Funciona melhor com imagens públicas na internet (fotos de stock, "
+        "posts de redes sociais, artes, produtos, etc.)\n"
+        "• Fotos muito genéricas ou privadas podem não ter correspondência\n\n"
+        "*Comandos disponíveis:*\n"
+        "/start — mensagem de boas-vindas\n"
+        "/help — esta mensagem"
+    )
+    await update.message.reply_text(texto_ajuda, parse_mode=ParseMode.MARKDOWN)
+
+
+# -----------------------------------------------------------------------
+# HANDLER PRINCIPAL: recebe a foto e inicia o pipeline de busca
+# -----------------------------------------------------------------------
+async def processar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mensagem = update.message
+    foto = mensagem.photo[-1]
+
+    mensagem_status = await mensagem.reply_text("🔎 Iniciando busca...")
+    await executar_pipeline_busca(foto.file_id, context, mensagem_status)
+
+
+# -----------------------------------------------------------------------
+# HANDLER: cliques nos botões inline
+# -----------------------------------------------------------------------
+async def tratar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()  # remove o "relógio de carregando" do botão
+
+    estado = context.user_data.get("ultima_busca")
+    if not estado:
+        await query.edit_message_text(
+            "⚠️ Essa busca expirou. Envie a foto novamente para buscar de novo."
+        )
+        return
+
+    acao = query.data
+
+    if acao == "novamente":
+        await query.edit_message_text("🔎 Iniciando nova busca...")
+        await executar_pipeline_busca(estado["file_id"], context, query.message)
+        return
+
+    if acao == "listar":
+        resultados = estado["resultados"]
+        teclado = montar_teclado_lista(resultados)
+        await query.edit_message_text(
+            "📋 *Resultados encontrados:*\nEscolha um para ver os detalhes.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=teclado,
+        )
+        return
+
+    if acao == "proximo":
+        resultados = estado["resultados"]
+        indice_atual = estado["indice_atual"]
+        proximo_indice = indice_atual + 1
+
+        if proximo_indice >= len(resultados):
+            await query.edit_message_text(
+                "🤷 Não há mais resultados alternativos para essa imagem.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔄 Buscar de novo", callback_data="novamente")]]
+                ),
+            )
+            return
+
+        estado["indice_atual"] = proximo_indice
+        texto = formatar_resultado(resultados[proximo_indice], proximo_indice, len(resultados))
+        teclado = montar_teclado_resultado(proximo_indice, len(resultados))
+        await query.edit_message_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado)
+        return
+
+    if acao.startswith("escolher:"):
+        indice_escolhido = int(acao.split(":", 1)[1])
+        resultados = estado["resultados"]
+
+        if indice_escolhido >= len(resultados):
+            await query.edit_message_text("⚠️ Resultado inválido.")
+            return
+
+        estado["indice_atual"] = indice_escolhido
+        texto = formatar_resultado(resultados[indice_escolhido], indice_escolhido, len(resultados))
+        teclado = montar_teclado_resultado(indice_escolhido, len(resultados))
+        await query.edit_message_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=teclado)
+        return
+
+    logger.warning("Callback desconhecido recebido: %s", acao)
 
 
 # -----------------------------------------------------------------------
@@ -335,15 +480,14 @@ def main() -> None:
     aplicacao = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     aplicacao.add_handler(CommandHandler("start", comando_start))
+    aplicacao.add_handler(CommandHandler("help", comando_help))
     aplicacao.add_handler(MessageHandler(filters.PHOTO, processar_foto))
+    aplicacao.add_handler(CallbackQueryHandler(tratar_callback))
     aplicacao.add_error_handler(tratador_de_erros)
 
     url_completa_webhook = f"{WEBHOOK_URL.rstrip('/')}/{CAMINHO_WEBHOOK}"
     logger.info("Bot iniciado em modo webhook: %s", url_completa_webhook)
 
-    # run_webhook sobe um mini-servidor HTTP interno (via Tornado), registra
-    # a URL no Telegram automaticamente e passa a receber updates via POST
-    # em vez de ficar perguntando (polling) a cada poucos segundos.
     aplicacao.run_webhook(
         listen="0.0.0.0",
         port=PORT,
