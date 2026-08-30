@@ -582,6 +582,30 @@ async def tratador_de_erros(update: object, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # -----------------------------------------------------------------------
+# CONFIGURAÇÃO DA DESCRIÇÃO (aparece ANTES do usuário apertar "Iniciar")
+# -----------------------------------------------------------------------
+async def configurar_descricao_bot(aplicacao: Application) -> None:
+    """
+    Define a mensagem exibida na tela inicial do bot, ANTES do usuário
+    apertar 'Iniciar' pela primeira vez (chat ainda vazio) — é o campo
+    'description' da API do Telegram. Também define a 'short_description',
+    que aparece no perfil do bot e quando ele é compartilhado/encaminhado.
+    """
+    await aplicacao.bot.set_my_description(
+        description=(
+            "🔎 Encontre a origem de qualquer imagem!\n\n"
+            "Envie uma foto e eu busco no Google Lens onde ela foi "
+            "publicada originalmente — perfil, post ou site.\n\n"
+            "Toque em Iniciar e me mande uma foto para começar."
+        )
+    )
+    await aplicacao.bot.set_my_short_description(
+        short_description="Envie uma foto e eu encontro a origem dela na internet via Google Lens."
+    )
+    logger.info("Descrição do bot configurada com sucesso.")
+
+
+# -----------------------------------------------------------------------
 # CONFIGURAÇÃO DO MENU DE COMANDOS (aparece ao lado da caixa de texto)
 # -----------------------------------------------------------------------
 async def configurar_menu_comandos(aplicacao: Application) -> None:
@@ -602,6 +626,12 @@ async def configurar_menu_comandos(aplicacao: Application) -> None:
     logger.info("Menu de comandos configurado com sucesso.")
 
 
+async def configurar_bot_no_inicio(aplicacao: Application) -> None:
+    """Roda todas as configurações de perfil/menu do bot ao iniciar."""
+    await configurar_descricao_bot(aplicacao)
+    await configurar_menu_comandos(aplicacao)
+
+
 # -----------------------------------------------------------------------
 # INICIALIZAÇÃO DO BOT
 # -----------------------------------------------------------------------
@@ -620,7 +650,7 @@ def main() -> None:
     aplicacao = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(configurar_menu_comandos)
+        .post_init(configurar_bot_no_inicio)
         .build()
     )
 
